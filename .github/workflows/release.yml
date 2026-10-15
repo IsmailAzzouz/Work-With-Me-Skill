@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Read release version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          match = re.search(r"^## (\d+\.\d+\.\d+)$", changelog, re.MULTILINE)
+          if match is None:
+              raise SystemExit("No release version found in CHANGELOG.md")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={match.group(1)}\n")
+          PY
+      - name: Build release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 scripts/package_release.py "$VERSION"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" --json isDraft,targetCommitish > "$RUNNER_TEMP/release.json"; then
+            draft=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["isDraft"]).lower())' "$RUNNER_TEMP/release.json")
+            if [ "$draft" = "false" ]; then
+              echo "Release $tag is already published; leaving it unchanged."
+              exit 0
+            fi
+            target=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["targetCommitish"])' "$RUNNER_TEMP/release.json")
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "Existing draft targets another commit; refusing to overwrite it."
+              exit 1
+            fi
+          else
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Work With Me $tag" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "$tag" "dist/work-with-me-$tag.zip" "dist/work-with-me-$tag.zip.sha256" --clobber
+          gh release edit "$tag" --draft=false --latest
